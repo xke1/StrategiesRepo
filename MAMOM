@@ -1,0 +1,180 @@
+# region imports                                                                                   # —— 导入 QC 的通用接口与类
+from AlgorithmImports import *                                                                      # —— QuantConnect Python API 入口
+import time                                                                                        # —— 这里暂未使用；可用于调试/节流
+# endregion
+
+class MultiAssetMomentum(QCAlgorithm):                                                             # —— 策略类：继承 QCAlgorithm
+
+    def Initialize(self):
+        self.SetStartDate(2024, 1, 1)                                                              # —— 回测开始日期
+        self.SetEndDate(2025, 3, 26)                                                               # —— 回测结束日期
+        self.SetCash(100000)                                                                       # —— 初始资金
+        self.SetWarmUp(30, Resolution.Daily)                                                       # —— 预热 30 个交易日，供指标充足样本
+
+        # ——— 参数：用 GetParameter 便于在回测/优化时外部传参（**注意：在 QC 中可能返回字符串**）
+        # 建议：实际跑前可做 float(...) 转换，避免与 float 比较时报类型错误                     # —— 例如：self.rsi_buy_top = float(self.GetParameter(...))
+        self.rsi_buy_top = self.GetParameter("rsi_buy_top", 80)                                    # —— RSI 买入上限阈值（默认 80）
+        self.rsi_buy_bot = self.GetParameter("rsi_buy_bot", 50)                                    # —— RSI 买入下限阈值（默认 50）
+
+        self.rsi_sell_top = self.GetParameter("rsi_sell_top", 90)                                  # —— 目前未使用：可扩展为卖出阈值（超买退出）
+        self.rsi_sell_bot = self.GetParameter("rsi_sell_bot", 40)                                  # —— 目前未使用：可扩展为卖出阈值（转弱退出）
+        
+        self.ema_short_period = self.GetParameter("ema_short_period", 12)                          # —— 短期 EMA 周期（默认 12）
+        self.ema_long_period  = self.GetParameter("ema_long_period", 26)                           # —— 长期 EMA 周期（默认 26）
+
+        self.atr_multiplier = 2                                                                     # —— 固定止损：入场价 - 2 * ATR
+        self.max_holding_days = 10                                                                  # —— 时间止损：最长持有 10 天（到期平仓）
+
+        # ——— 基础环境设置
+        self.UniverseSettings.Resolution = Resolution.Daily                                         # —— 全部资产按日频
+        self.UniverseSettings.Asynchronous = True                                                   # —— 异步订阅（减少阻塞；对海量资产有用）
+
+        # ——— 资产池（固定清单）
+        # Crypto（加密货币）
+        self.crypto_symbols = ["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "ADAUSD", "DOGEUSD"]        # —— 六大主流币，波动大、ATR 较高
+        # Tech（美股科技龙头 + 台积电 + 阿里）
+        self.tech_symbols   = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "TSM", "BABA"]
+        # Energy（大宗能源股）
+        self.energy_symbols = ["XOM", "CVX", "BP", "TOT", "COP", "SHEL"]                            # —— 不同行业分散相关性
+        # FX（外汇主流货币对）
+        self.fx_symbols     = ["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD", "EURJPY", "GBPJPY", "EURGBP"]
+
+        # ——— 指标/仓位跟踪容器
+        self.rsi   = {}                                                                             # —— 每个 symbol 一个 RSI
+        self.ema_short = {}                                                                         # —— 每个 symbol 一个短 EMA
+        self.ema_long  = {}                                                                         # —— 每个 symbol 一个长 EMA
+        self.macd = {}                                                                              # —— 每个 symbol 一个 MACD（12,26,9）
+        self.atr  = {}                                                                              # —— 每个 symbol 一个 ATR（14）
+        self.entry_prices = {}                                                                       # —— 入场价格
+        self.entry_dates  = {}                                                                       # —— 入场日期（用于时间止损）
+        self.stop_losses  = {}                                                                       # —— 固定（入场即设定）ATR 止损价
+        self.trailing_stop_losses = {}                                                               # —— 跟踪止损价（只在价格创新高时抬升）
+
+        # ——— 订阅数据（注意：多资产类别同用 Daily；回测需有相应数据包）
+        for symbol in self.crypto_symbols:
+            self.AddCrypto(symbol, Resolution.Daily)                                                # —— 加密货币（默认美元计价）
+        for symbol in self.tech_symbols + self.energy_symbols:
+            self.AddEquity(symbol, Resolution.Daily)                                                # —— 美股与港股 ADR 等股票
+        for symbol in self.fx_symbols:
+            self.AddForex(symbol, Resolution.Daily)                                                 # —— 外汇对（点值/杠杆与风险需特别注意）
+
+        # ——— 初始化技术指标（与上面订阅一致）
+        for symbol in self.crypto_symbols + self.tech_symbols + self.energy_symbols + self.fx_symbols:
+            self.rsi[symbol]        = self.RSI(symbol, 14, MovingAverageType.Simple, Resolution.Daily)      # —— RSI-14
+            self.ema_short[symbol]  = self.EMA(symbol, 12, Resolution.Daily)                                # —— EMA-12
+            self.ema_long[symbol]   = self.EMA(symbol, 26, Resolution.Daily)                                # —— EMA-26
+            self.macd[symbol]       = self.MACD(symbol, 12, 26, 9, MovingAverageType.Exponential, Resolution.Daily)  # —— MACD
+            self.atr[symbol]        = self.ATR(symbol, 14, MovingAverageType.Simple, Resolution.Daily)      # —— ATR-14
+
+    def OnData(self, data):
+        if self.IsWarmingUp:                                                                          # —— 指标仍在预热：不交易
+            return
+
+        current_time = self.Time                                                                      # —— 记录当前时间（用于时间止损）
+
+        # ——— 先检查已有持仓的退出逻辑（时间止损 / ATR 固定止损 / 跟踪止损）
+        for symbol in list(self.entry_prices.keys()):                                                 # —— 注意：遍历时用 list(...) 以便中途删除
+            if symbol not in data.Bars:
+                # self.Debug(f"{symbol} No data available at this time.")                             # —— 某些时段/资产可能缺 Bar（跨市场日历）
+                continue
+
+            current_price = data.Bars[symbol].Close                                                   # —— 最新收盘
+            atr_value     = self.atr[symbol].Current.Value                                            # —— 最新 ATR 值（波动度）
+
+            # 1) 时间止损：持仓 ≥ max_holding_days 天则强制平仓
+            if (current_time - self.entry_dates[symbol]).days >= self.max_holding_days:
+                self.Debug(f"Time-based stop-loss triggered for {symbol}")
+                self.Liquidate(symbol)                                                                # —— 全部卖出该标的
+                self.RemovePositionTracking(symbol)                                                   # —— 清理跟踪字典
+                continue
+
+            # 2) 固定 ATR 止损：价格跌破入场时设定的止损价（entry - 2*ATR）
+            if current_price < self.stop_losses[symbol]:
+                self.Debug(f"ATR stop-loss triggered for {symbol}")
+                self.Liquidate(symbol)
+                self.RemovePositionTracking(symbol)
+                continue
+
+            # 3) 跟踪止损：当价格创新高时，把止损价抬升到（当前价 - 1.5*ATR）
+            if current_price > self.entry_prices[symbol]:                                             # —— 只在盈利推进时上调
+                self.trailing_stop_losses[symbol] = max(self.trailing_stop_losses[symbol],
+                                                        current_price - 1.5 * atr_value)
+
+            # 跟踪止损触发：价格回落穿越跟踪止损线
+            if current_price < self.trailing_stop_losses[symbol]:
+                self.Debug(f"Trailing stop-loss triggered for {symbol}")
+                self.Liquidate(symbol)
+                self.RemovePositionTracking(symbol)
+
+        # ——— 再检查新的入场信号（动量/趋势过滤 + RSI 区间 + MACD 多头柱）
+        for symbol in self.rsi.keys():
+            if symbol not in data.Bars:                                                                # —— 没有当日 Bar（例如休市/数据缺失）
+                continue
+
+            current_price   = data.Bars[symbol].Close
+            rsi_value       = self.rsi[symbol].Current.Value
+            ema_short_value = self.ema_short[symbol].Current.Value
+            ema_long_value  = self.ema_long[symbol].Current.Value
+            macd_line       = self.macd[symbol].Current.Value
+            signal_line     = self.macd[symbol].Signal.Current.Value
+            histogram       = macd_line - signal_line                                                 # —— MACD 柱 > 0 视为多头动量
+            atr_value       = self.atr[symbol].Current.Value
+
+            # —— 入场条件（**核心思想**：多重滤波后做多 5% 仓位）
+            # ① 未持仓；② 短 EMA 在长 EMA 之上（上升趋势过滤）；③ RSI 落在 [bot, top] 区间（避免极端超买/超卖）
+            # ④ MACD 柱为正（动量向上）
+            if (
+                self.entry_prices.get(symbol) is None and
+                ema_short_value > ema_long_value and
+                self.rsi_buy_bot <= rsi_value <= self.rsi_buy_top and 
+                histogram > 0
+            ):
+                self.Debug(f"Buying {symbol}")
+                self.SetHoldings(symbol, 0.05)                                                        # —— 固定 5% 目标权重（未做按波动或相关性分配）
+                self.entry_prices[symbol] = current_price
+                self.entry_dates[symbol]  = current_time
+
+                # —— 入场即设固定 ATR 止损线（更“硬”的底线）
+                self.stop_losses[symbol] = current_price - self.atr_multiplier * atr_value
+
+                # —— 初始化跟踪止损线（动态抬升，锁定盈利）
+                self.trailing_stop_losses[symbol] = current_price - 1.5 * atr_value
+
+    def RemovePositionTracking(self, symbol):
+        """Removes tracking data for a symbol when a position is closed."""                           # —— 平仓后，清理所有该标的跟踪信息
+        del self.entry_prices[symbol]
+        del self.entry_dates[symbol]
+        del self.stop_losses[symbol]
+        del self.trailing_stop_losses[symbol]
+
+        # ——— 下面这段是你暂存的“卖出逻辑/调仓模板”，被整体注释掉了；保留作参考                           # —— 若将来希望增加“趋势/动量反转即卖出”，可恢复并融合
+        '''    self.Debug(f"{symbol}: rsi {rsi_value} emaS{ema_short_value} emaL {ema_long_value} histogram {histogram} ") 
+            # Exit condition: bearish crossover or MACD reversal
+            if ema_short_value < ema_long_value or histogram < 0:
+                self.Debug(f"Selling {symbol}")
+                self.Liquidate(symbol)
+                del self.entry_prices[symbol]
+
+        # Entry conditions
+        for symbol in self.rsi.keys():
+            if symbol not in data.Bars:
+                self.Debug(f"{symbol} No data available at this time.")
+                continue  # Skip if no data
+            current_price = data.Bars[symbol].Close
+            rsi_value = self.rsi[symbol].Current.Value
+            ema_short_value = self.ema_short[symbol].Current.Value
+            ema_long_value = self.ema_long[symbol].Current.Value
+            macd_line = self.macd[symbol].Current.Value
+            signal_line = self.macd[symbol].Signal.Current.Value
+            histogram = macd_line - signal_line
+
+            self.Debug(f"{symbol}: rsi {rsi_value} emaS{ema_short_value} emaL {ema_long_value} histogram {histogram} ")
+            if (
+                self.entry_prices.get(symbol) is None and  # Not already holding
+                ema_short_value > ema_long_value and
+                self.rsi_buy_bot <= rsi_value <= self.rsi_buy_top and 
+                histogram > 0
+            ):
+                self.Debug(f"Buying {symbol}")
+                self.SetHoldings(symbol, 0.05)
+                self.entry_prices[symbol] = current_price'''
