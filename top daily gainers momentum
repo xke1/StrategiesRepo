@@ -1,0 +1,29 @@
+#top daily gainers momentum
+
+from AlgorithmImports import *
+
+class ShortingYesterdayTopDailyGainers(QCAlgorithm):
+
+    def initialize(self):
+        self.set_cash(1_000_000)
+        self.set_start_date(2023, 2, 13)
+        etf = self.add_equity("QQQ").symbol
+        self.add_universe(self.universe.etf(etf))
+        self.settings.rebalance_portfolio_on_insight_changes = False
+        self.universe_settings.schedule.on(self.date_rules.month_start())
+        self.schedule.on(self.date_rules.every_day(etf), self.time_rules.before_market_close(etf, 1), self.store_closes)
+        self.schedule.on(self.date_rules.every_day(etf), self.time_rules.after_market_open(etf, 1), self.gap_check)
+        self.set_portfolio_construction(EqualWeightingPortfolioConstructionModel())
+        self.closes = {}
+        self.gap_size = 0.05 # float(self.get_parameter("gap_size", 10))/100
+        self.insight_period = 10 # int(float(self.get_parameter("insight_period", 5)))
+        
+    def store_closes(self):
+        self.closes = {security : security.price for security in self.active_securities.values if security.price > 0}
+
+    def gap_check(self):
+        if not self.closes: return
+        gap = {security.symbol: ((security.price - close) / close) for (security, close) in self.closes.items() \
+               if ((security.price - close) / close) > self.gap_size}
+        gap_rank = list(dict(sorted(gap.items(), key=lambda item: item[1], reverse=True)).keys())[:10]
+        self.emit_insights([Insight.price(symbol, timedelta(self.insight_period), InsightDirection.UP) for symbol in gap_rank])
