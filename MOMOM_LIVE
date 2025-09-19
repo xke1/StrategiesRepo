@@ -1,0 +1,158 @@
+# region imports
+from AlgorithmImports import *
+# endregion
+
+class MultiAssetMomentum(QCAlgorithm):
+
+    def Initialize(self):
+        # —— 回测日期对 Live 无影响；留着方便本地/回测验证
+        self.SetStartDate(2024, 1, 1)
+        self.SetEndDate(2025, 3, 26)
+        self.SetCash(100000)
+
+        # —— 预热天数：MACD(12,26,9) 需要 ~47 根；取 60 更稳
+        self.SetWarmUp(60, Resolution.Daily)
+
+        # ===== 参数安全读取（GetParameter 可能返回字符串）=====
+        def _pfloat(name, default):
+            v = self.GetParameter(name)
+            try:
+                return float(v) if v not in (None, "") else float(default)
+            except Exception:
+                return float(default)
+
+        def _pint(name, default):
+            v = self.GetParameter(name)
+            try:
+                return int(float(v)) if v not in (None, "") else int(default)
+            except Exception:
+                return int(default)
+
+        self.rsi_buy_top    = _pfloat("rsi_buy_top", 80)
+        self.rsi_buy_bot    = _pfloat("rsi_buy_bot", 50)
+        self.rsi_sell_top   = _pfloat("rsi_sell_top", 90)   # 预留
+        self.rsi_sell_bot   = _pfloat("rsi_sell_bot", 40)   # 预留
+        self.ema_short_p    = _pint("ema_short_period", 12)
+        self.ema_long_p     = _pint("ema_long_period", 26)
+
+        self.atr_multiplier     = 2.0
+        self.max_holding_days   = 10
+
+        # ===== 资产池（字符串 → 订阅 → Symbol 对象）=====
+        crypto = ["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "ADAUSD", "DOGEUSD"]
+        tech   = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "TSM", "BABA"]
+        energy = ["XOM", "CVX", "BP", "TTE", "COP", "SHEL"]   # Total 对应美股代码 TTE
+        fx     = ["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD", "EURJPY", "GBPJPY", "EURGBP"]
+
+        self.crypto = [ self.AddCrypto(t, Resolution.Daily).Symbol for t in crypto ]
+        self.equity = [ self.AddEquity(t, Resolution.Daily).Symbol for t in tech + energy ]
+        self.fx     = [ self.AddForex(t, Resolution.Daily).Symbol  for t in fx ]
+        self.symbols = self.crypto + self.equity + self.fx
+
+        # ===== 指标容器（全部用 Symbol 作为 key，避免 Live 中 Bars 匹配失败）=====
+        self.rsi   = {}
+        self.ema_s = {}
+        self.ema_l = {}
+        self.macd  = {}
+        self.atr   = {}
+
+        for sym in self.symbols:
+            self.rsi[sym]   = self.RSI(sym, 14, MovingAverageType.Simple, Resolution.Daily)
+            self.ema_s[sym] = self.EMA(sym, self.ema_short_p, Resolution.Daily)
+            self.ema_l[sym] = self.EMA(sym, self.ema_long_p, Resolution.Daily)
+            self.macd[sym]  = self.MACD(sym, 12, 26, 9, MovingAverageType.Exponential, Resolution.Daily)
+            self.atr[sym]   = self.ATR(sym, 14, MovingAverageType.Simple, Resolution.Daily)
+
+        # ===== 持仓跟踪（用 Symbol 作为 key）=====
+        self.entry_price = {}
+        self.entry_time  = {}
+        self.hard_sl     = {}   # 固定 ATR 止损（入场即设）
+        self.trail_sl    = {}   # 跟踪止损（盈利时上移）
+
+        # 防止一次性下太多单：简单限仓（可按需调整）
+        self.max_concurrent_positions = 15
+
+    # -------- 交易主逻辑 --------
+    def OnData(self, data: Slice):
+        if self.IsWarmingUp:
+            return
+
+        now = self.Time
+
+        # === 先处理已有持仓的退出（时间/固定ATR/跟踪）===
+        for sym in list(self.entry_price.keys()):
+            if not data.Bars.ContainsKey(sym):
+                continue
+            # 指标未就绪不做风控，避免用到无效值
+            if not self.atr[sym].IsReady:
+                continue
+
+            price = data.Bars[sym].Close
+            atr   = self.atr[sym].Current.Value
+
+            # 1) 时间止损
+            if (now - self.entry_time[sym]).days >= self.max_holding_days:
+                self.Liquidate(sym)
+                self._forget(sym)
+                continue
+
+            # 2) 固定 ATR 止损
+            if price < self.hard_sl[sym]:
+                self.Liquidate(sym)
+                self._forget(sym)
+                continue
+
+            # 3) 跟踪止损上移与触发
+            # 若价格创新高（相对入场价），把跟踪止损抬到 price - 1.5*ATR
+            if price > self.entry_price[sym]:
+                self.trail_sl[sym] = max(self.trail_sl[sym], price - 1.5 * atr)
+
+            if price < self.trail_sl[sym]:
+                self.Liquidate(sym)
+                self._forget(sym)
+                continue
+
+        # === 新开仓：动量/趋势/RSI/MACD 过滤 ===
+        # 控制总持仓数量，避免 SetHoldings 遍地开花
+        open_positions = sum(1 for s in self.symbols if self.Portfolio[s].Invested)
+        slots_left = max(0, self.max_concurrent_positions - open_positions)
+        if slots_left == 0:
+            return
+
+        for sym in self.symbols:
+            if slots_left == 0:
+                break
+            if self.Portfolio[sym].Invested:
+                continue
+            if not data.Bars.ContainsKey(sym):
+                continue
+
+            # 指标就绪性检查（Live 很关键）
+            inds = (self.rsi[sym], self.ema_s[sym], self.ema_l[sym], self.macd[sym], self.atr[sym])
+            if not all(ind.IsReady for ind in inds):
+                continue
+
+            price = data.Bars[sym].Close
+            rsi   = self.rsi[sym].Current.Value
+            ema_s = self.ema_s[sym].Current.Value
+            ema_l = self.ema_l[sym].Current.Value
+            macd  = self.macd[sym].Current.Value
+            sig   = self.macd[sym].Signal.Current.Value
+            hist  = macd - sig
+            atr   = self.atr[sym].Current.Value
+
+            # 入场条件：趋势向上 + RSI 在区间内 + MACD 柱为正
+            if (ema_s > ema_l) and (self.rsi_buy_bot <= rsi <= self.rsi_buy_top) and (hist > 0):
+                self.SetHoldings(sym, 0.05)         # 每标的 5% 目标权重（简单版）
+                self.entry_price[sym] = price
+                self.entry_time[sym]  = now
+                self.hard_sl[sym]     = price - self.atr_multiplier * atr
+                self.trail_sl[sym]    = price - 1.5 * atr
+                slots_left -= 1
+
+    # -------- 工具：清理跟踪 --------
+    def _forget(self, sym):
+        if sym in self.entry_price: del self.entry_price[sym]
+        if sym in self.entry_time:  del self.entry_time[sym]
+        if sym in self.hard_sl:     del self.hard_sl[sym]
+        if sym in self.trail_sl:    del self.trail_sl[sym]
